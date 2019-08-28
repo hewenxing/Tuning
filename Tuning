@@ -1,0 +1,122 @@
+内核调优
+echo "
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.forwarding = 1
+net.ipv4.neigh.default.gc_thresh1 = 4096
+net.ipv4.neigh.default.gc_thresh2 = 6144
+net.ipv4.neigh.default.gc_thresh3 = 8192
+net.ipv4.neigh.default.gc_interval=60
+net.ipv4.neigh.default.gc_stale_time=120
+" >> /etc/sysctl.conf
+
+sysctl -p
+
+
+
+ETCD调优
+磁盘IOPS
+etcd对磁盘写入延迟非常敏感，通常需要50顺序写入IOPS(例如: 7200RPM磁盘)。对于负载较重的集群，建议使用500顺序写入IOPS(例如，典型的本地SSD或高性能虚拟化块设备)。请注意，大多数云服务器或者云存储提供并发IOPS而不是顺序IOPS，提供的并发IOPS可能比顺序IOPS大10倍。为了测量实际的顺序IOPS，建议使用磁盘基准测试工具，如diskbench或fio。
+
+PS
+常见磁盘平均物理寻道时间约为: 
+7200转/分的STAT硬盘平均物理寻道时间是9ms 
+10000转/分的STAT硬盘平均物理寻道时间是6ms 
+15000转/分的SAS硬盘平均物理寻道时间是4ms
+
+常见硬盘的旋转延迟时间约为: 
+7200 rpm的磁盘平均旋转延迟大约为60X1000/7200/2=4.17ms 
+10000 rpm的磁盘平均旋转延迟大约为60X1000/10000/2=3ms，
+15000 rpm的磁盘其平均旋转延迟约为60X1000/15000/2=2ms。
+
+最大IOPS的理论计算方法:
+IOPS=1000ms/(寻道时间+旋转延迟)。忽略数据传输时间。
+7200 rpm的磁盘IOPS=1000/(9+4.17)=76IOPS
+10000 rpm的磁盘IOPS=1000/(6+3)=111IOPS
+15000 rpm的磁盘IOPS=1000/(4+2)=166IOPS
+
+磁盘IO优先级
+由于etcd必须将数据持久保存到磁盘日志文件中，因此来自其他进程的磁盘活动可能会导致增加写入时间，结果可能会导致etcd请求超时和临时leader丢失。当给定高磁盘优先级时，etcd服务可以稳定地与这些进程一起运行。
+
+在Linux上，etcd的磁盘优先级可以配置为ionice：
+sudo ionice -c2 -n0 -p $(pgrep etcd)
+
+数据压缩
+etcd 默认不会自动进行数据压缩，etcd保存了keys的历史信息，数据频繁的改动会导致数据版本越来越多，相对应的数据库就会越来越大。etcd数据库大小默认2GB，当在etcd容器或者rancher ui出现以下日志时，说明数据库空间占满，需要进行数据压缩腾出空间。
+#Error from server: etcdserver: mvcc: database space exceeded
+释放空间
+登录etcd容器
+docker exec -ti etcd sh
+获取历史版本号
+er=$(etcdctl endpoint status --write-out="json" | egrep -o '"revision":[0-9]*' | egrep -o '[0-9].*')
+压缩旧版本
+etcdctl compact $ver
+清理碎片
+etcdctl defrag
+忽略etcd告警
+通过执行etcdctl alarm list可以查看etcd的告警情况，如果存在告警，即使释放了etcd空间，etcd也处于只读状态。
+在确定以上的操作均执行完毕后，在任意一个etcd容器中执行以下命令忽略告警
+etcdctl alarm disarm
+修改空间配额大小
+默认ETCD空间配额大小为2G，超过2G将不再写入数据。通过给ETCD配置--quota-backend-bytes参数增大空间配额,最大支持8G。
+RKE或者Rancher UI自定义部署集群的时候，在yaml文件中指定以下参数
+services:
+  etcd:
+    # 开启自动备份
+    ## rke版本大于等于0.2.x或rancher版本大于等于2.2.0时使用
+    backup_config:
+      enabled: true
+      interval_hours: 12
+      retention: 6
+    ## rke版本小于0.2.x或rancher版本小于2.2.0时使用
+    snapshot: true
+    creation: 5m0s
+    retention: 24h
+    # 修改空间配额为$((6*1024*1024*1024))，默认2G,最大8G
+    extra_args:
+      quota-backend-bytes: '6442450944'
+      auto-compaction-retention: 240 #(单位小时)
+
+
+Docker调优
+配置镜像加速地址
+通过配置镜像加速地址registry-mirrors,可以很大程度提高镜像下载速度。
+配置Docker存储驱动
+OverlayFS是一个新一代的联合文件系统，类似于AUFS，但速度更快，实现更简单。Docker为OverlayFS提供了两个存储驱动程序:旧版的overlay，新版的overlay2(更稳定)。
+配置日志文件大小
+容器中会产生大量日志文件，很容器占满磁盘空间。通过设置日志文件大小，可以有效控制日志文件对磁盘的占用量。
+修改Docker默认IP地址
+Docker第一次运行时会自动创建名为docker0的网络接口，默认接口地址为172.17.0.1/16。在一些企业中，可能已经使用了这个网段的地址，或者规划以后会使用这个网段的地址。所以，建议在安装好docker服务后，第一时间修改docker0接口地址，避免后期出现网段冲突。
+
+停止docker运行
+systemctl stop docker.service
+
+删除已有的docker0接口
+sudo ip link del docker0
+
+修改docker配置文件
+在/etc/docker/daemon.json中添加"bip": "169.254.123.1/24",
+
+综合配置
+touch /etc/docker/daemon.json
+cat > /etc/docker/daemon.json <<EOF
+{
+    "oom-score-adjust": -1000,
+    "log-driver": "json-file",
+    "log-opts": {
+    "max-size": "100m",
+    "max-file": "3"
+    },
+    "max-concurrent-downloads": 10,
+    "max-concurrent-uploads": 10,
+    "bip": "169.254.123.1/24",
+    "registry-mirrors": ["https://7bezldxe.mirror.aliyuncs.com"],
+    "storage-driver": "overlay2",
+    "storage-opts": [
+    "overlay2.override_kernel_check=true"
+    ]
+
+docker.service配置
+防止docker服务OOM： OOMScoreAdjust=-1000
+开启iptables转发链： ExecStartPost=/usr/sbin/iptables -P FORWARD ACCEPT (centos)
